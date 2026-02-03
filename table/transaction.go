@@ -325,7 +325,7 @@ func (t *Transaction) Append(ctx context.Context, rdr array.RecordReader, snapsh
 		appendFiles.appendDataFile(df)
 	}
 
-	updates, reqs, err := appendFiles.commit()
+	updates, reqs, err := appendFiles.commit(0)
 	if err != nil {
 		return err
 	}
@@ -424,7 +424,7 @@ func (t *Transaction) ReplaceDataFiles(ctx context.Context, filesToDelete, files
 		updater.appendDataFile(df)
 	}
 
-	updates, reqs, err := updater.commit()
+	updates, reqs, err := updater.commit(0)
 	if err != nil {
 		return err
 	}
@@ -491,7 +491,7 @@ func (t *Transaction) AddFiles(ctx context.Context, files []string, snapshotProp
 		updater.appendDataFile(df)
 	}
 
-	updates, reqs, err := updater.commit()
+	updates, reqs, err := updater.commit(0)
 	if err != nil {
 		return err
 	}
@@ -551,24 +551,182 @@ func (t *Transaction) Commit(ctx context.Context) (*Table, error) {
 
 	t.committed = true
 
-	if len(t.meta.updates) > 0 {
-		t.reqs = append(t.reqs, AssertTableUUID(t.meta.uuid))
-		tbl, err := t.tbl.doCommit(ctx, t.meta.updates, t.reqs)
-		if err != nil {
-			return tbl, err
-		}
+	if len(t.meta.updates) == 0 {
+		return t.tbl, nil
+	}
 
-		for _, u := range t.meta.updates {
-			if perr := u.PostCommit(ctx, t.tbl, tbl); perr != nil {
-				err = errors.Join(err, perr)
+	// Check if this is an append-only transaction
+	if t.isAppendOnlyOperation() {
+		return t.commitWithRetry(ctx)
+	}
+
+	return t.commitWithoutRetry(ctx)
+}
+
+// isAppendOnlyOperation checks if all updates in the transaction are append operations
+func (t *Transaction) isAppendOnlyOperation() bool {
+	for _, u := range t.meta.updates {
+		if addSnap, ok := u.(*addSnapshotUpdate); ok {
+			if addSnap.Snapshot.Summary == nil || addSnap.Snapshot.Summary.Operation != OpAppend {
+				return false
 			}
+		} else {
+			// Non-snapshot updates (schema, spec, etc.) disqualify retry
+			return false
 		}
+	}
+	return true
+}
 
+// commitWithoutRetry performs a single commit attempt without retry logic
+func (t *Transaction) commitWithoutRetry(ctx context.Context) (*Table, error) {
+	t.reqs = append(t.reqs, AssertTableUUID(t.meta.uuid))
+	tbl, err := t.tbl.doCommit(ctx, t.meta.updates, t.reqs)
+	if err != nil {
 		return tbl, err
 	}
 
-	return t.tbl, nil
+	for _, u := range t.meta.updates {
+		if perr := u.PostCommit(ctx, t.tbl, tbl); perr != nil {
+			err = errors.Join(err, perr)
+		}
+	}
+
+	return tbl, err
 }
+
+// commitWithRetry implements retry logic for append-only operations
+func (t *Transaction) commitWithRetry(ctx context.Context) (*Table, error) {
+	cfg := newRetryConfig(t.tbl.metadata.Properties())
+
+	if cfg.maxRetries == 0 {
+		// Retry disabled
+		return t.commitWithoutRetry(ctx)
+	}
+
+	startTime := time.Now()
+	totalTimeoutDuration := time.Duration(cfg.totalRetryTimeMs) * time.Millisecond
+
+	var lastErr error
+	for attempt := 0; attempt <= cfg.maxRetries; attempt++ {
+		// Check total time budget
+		if time.Since(startTime) > totalTimeoutDuration {
+			return nil, fmt.Errorf("retry timeout exceeded after %v: %w", time.Since(startTime), lastErr)
+		}
+
+		// Check context cancellation
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("context cancelled during retry: %w", err)
+		}
+
+		// Attempt commit
+		tbl, err := t.attemptCommit(ctx, attempt)
+		if err == nil {
+			// Success!
+			// TODO: Cleanup failed attempt manifest lists (future enhancement)
+			return tbl, nil
+		}
+
+		lastErr = err
+
+		// Check if error is retriable
+		if !isRetriableCommitError(err) {
+			return nil, fmt.Errorf("non-retriable error on attempt %d: %w", attempt, err)
+		}
+
+		// If this was the last retry, fail
+		if attempt == cfg.maxRetries {
+			return nil, fmt.Errorf("commit failed after %d retries: %w", cfg.maxRetries+1, err)
+		}
+
+		// Refresh table metadata for next attempt
+		if refreshErr := t.tbl.Refresh(ctx); refreshErr != nil {
+			return nil, fmt.Errorf("failed to refresh table on retry attempt %d: %w", attempt, refreshErr)
+		}
+
+		// Rebuild transaction for retry
+		if rebuildErr := t.rebuildForRetry(); rebuildErr != nil {
+			return nil, fmt.Errorf("failed to rebuild transaction on retry attempt %d: %w", attempt, rebuildErr)
+		}
+
+		// Exponential backoff before next attempt
+		backoffDuration := cfg.exponentialBackoff(attempt)
+
+		// Ensure we don't exceed total timeout during sleep
+		if time.Since(startTime)+backoffDuration > totalTimeoutDuration {
+			remainingTime := totalTimeoutDuration - time.Since(startTime)
+			if remainingTime > 0 {
+				backoffDuration = remainingTime
+			} else {
+				return nil, fmt.Errorf("retry timeout exceeded: %w", lastErr)
+			}
+		}
+
+		select {
+		case <-time.After(backoffDuration):
+			// Continue to next attempt
+		case <-ctx.Done():
+			return nil, fmt.Errorf("context cancelled during backoff: %w", ctx.Err())
+		}
+	}
+
+	return nil, fmt.Errorf("commit failed after retries: %w", lastErr)
+}
+
+// attemptCommit performs a single commit attempt
+func (t *Transaction) attemptCommit(ctx context.Context, attempt int) (*Table, error) {
+	// Use existing updates (they have attempt=0, but that's okay for now)
+	// Future enhancement: regenerate with new attempt numbers
+
+	// Add requirements
+	reqs := append([]Requirement{}, t.reqs...)
+	reqs = append(reqs, AssertTableUUID(t.meta.uuid))
+
+	// Attempt commit
+	tbl, err := t.tbl.doCommit(ctx, t.meta.updates, reqs)
+	if err != nil {
+		return tbl, err
+	}
+
+	// Run PostCommit hooks
+	for _, u := range t.meta.updates {
+		if perr := u.PostCommit(ctx, t.tbl, tbl); perr != nil {
+			err = errors.Join(err, perr)
+		}
+	}
+
+	return tbl, err
+}
+
+// rebuildForRetry refreshes the metadata builder and requirements with current table state
+func (t *Transaction) rebuildForRetry() error {
+	// Rebuild metadata builder from refreshed table
+	var err error
+	t.meta, err = MetadataBuilderFromBase(t.tbl.metadata, t.tbl.metadataLocation)
+	if err != nil {
+		return fmt.Errorf("failed to rebuild metadata builder: %w", err)
+	}
+
+	// Rebuild requirements based on new snapshot IDs
+	// The AssertRefSnapshotID requirement needs to use the new current snapshot
+	newReqs := make([]Requirement, 0, len(t.reqs))
+	for _, req := range t.reqs {
+		// Update snapshot-based requirements to use current snapshot ID
+		if refReq, ok := req.(*assertRefSnapshotID); ok {
+			if current := t.tbl.CurrentSnapshot(); current != nil {
+				newReqs = append(newReqs, AssertRefSnapshotID(refReq.Ref, &current.SnapshotID))
+			} else {
+				newReqs = append(newReqs, AssertRefSnapshotID(refReq.Ref, nil))
+			}
+		} else {
+			newReqs = append(newReqs, req)
+		}
+	}
+	t.reqs = newReqs
+
+	return nil
+}
+
 
 type StagedTable struct {
 	*Table

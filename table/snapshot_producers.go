@@ -678,7 +678,7 @@ func (sp *snapshotProducer) summary(props iceberg.Properties) (Summary, error) {
 	}, previousSummary)
 }
 
-func (sp *snapshotProducer) commit() (_ []Update, _ []Requirement, err error) {
+func (sp *snapshotProducer) commit(attempt int) (_ []Update, _ []Requirement, err error) {
 	newManifests, err := sp.manifests()
 	if err != nil {
 		return nil, nil, err
@@ -690,7 +690,7 @@ func (sp *snapshotProducer) commit() (_ []Update, _ []Requirement, err error) {
 		return nil, nil, err
 	}
 
-	fname := newManifestListFileName(sp.snapshotID, 0, sp.commitUuid)
+	fname := newManifestListFileName(sp.snapshotID, attempt, sp.commitUuid)
 	locProvider, err := sp.txn.tbl.LocationProvider()
 	if err != nil {
 		return nil, nil, err
