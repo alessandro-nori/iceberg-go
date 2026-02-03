@@ -64,6 +64,18 @@ const (
 	ManifestMinMergeCountKey     = "commit.manifest.min-count-to-merge"
 	ManifestMinMergeCountDefault = 100
 
+	CommitNumRetriesKey     = "commit.retry.num-retries"
+	CommitNumRetriesDefault = 4
+
+	CommitMinRetryWaitMsKey     = "commit.retry.min-retry-wait-ms"
+	CommitMinRetryWaitMsDefault = 100 // 100ms
+
+	CommitMaxRetryWaitMsKey     = "commit.retry.max-retry-wait-ms"
+	CommitMaxRetryWaitMsDefault = 60000 // 60 seconds
+
+	CommitTotalRetryTimeMsKey     = "commit.retry.total-retry-time-ms"
+	CommitTotalRetryTimeMsDefault = 1800000 // 30 minutes
+
 	WritePartitionSummaryLimitKey     = "write.summary.partition-limit"
 	WritePartitionSummaryLimitDefault = 0
 
